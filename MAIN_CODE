@@ -1,0 +1,230 @@
+import random
+import pandas as pd
+import json
+import os
+import google.generativeai as genai
+from sentence_transformers import SentenceTransformer, util
+import docx
+import streamlit as st
+import pdfplumber
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Static API Key for Gemini Model
+API_KEY = "AIzaSyDIP9XB3h5BXXW6ORe_VuVYbapLsoVl2kU"  # Replace this with your actual API key
+genai.configure(api_key=API_KEY)
+model = genai.GenerativeModel("models/gemini-1.5-pro")
+
+# Configuration Files
+CONFIG_FILE = "config.json"
+UPLOAD_FOLDER = 'uploads/'
+RESULTS_FOLDER = 'results/'
+ALLOWED_EXTENSIONS = {'pdf', 'txt', 'docx', 'csv'}
+
+# Create directories if not exist
+if not os.path.exists(UPLOAD_FOLDER):
+    os.makedirs(UPLOAD_FOLDER)
+if not os.path.exists(RESULTS_FOLDER):
+    os.makedirs(RESULTS_FOLDER)
+
+# Function to handle text extraction from uploaded file
+def extract_text_from_file(file_path):
+    ext = file_path.rsplit('.', 1)[1].lower()  # Get file extension
+    if ext == 'pdf':
+        with pdfplumber.open(file_path) as pdf:
+            text = ''.join([page.extract_text() for page in pdf.pages])
+        return text
+    elif ext == 'docx':
+        doc = docx.Document(file_path)
+        text = ' '.join([para.text for para in doc.paragraphs])
+        return text
+    elif ext == 'txt':
+        with open(file_path, 'r') as file:
+            return file.read()
+    elif ext == 'csv':
+        # Read the CSV file and return the data as a string
+        df = pd.read_csv(file_path)
+        return df.to_string()  # Convert CSV data to string for MCQ generation
+    return None
+
+# Function to generate MCQs based on the provided text or dataset
+def generate_mcqs_from_text(text, num_questions=5, mcq_type="Paragraph-Based"):
+    if mcq_type == "Paragraph-Based":
+        prompt = f"""
+        You are an AI assistant helping the user generate multiple-choice questions (MCQs) based on the following text:
+        '{text}'
+        Please generate {num_questions} MCQs from the text. Each question should have:
+        - A clear question
+        - Four answer options (labeled A, B, C, D)
+        - The correct answer clearly indicated
+        Format:
+        ## MCQ
+        Question: [question]
+        A) [option A]
+        B) [option B]
+        C) [option C]
+        D) [option D]
+        Correct Answer: [correct option]
+        """
+    elif mcq_type == "Aptitude-Based":
+        prompt = f"""
+        You are an AI assistant helping the user generate multiple-choice questions (MCQs) based on the following dataset of aptitude problems:
+        '{text}'
+        Please generate {num_questions} MCQs from the data. Each question should involve numerical or logical reasoning and:
+        - A clear question
+        - Four answer options (labeled A, B, C, D)
+        - The correct answer clearly indicated
+        Format:
+        ## MCQ
+        Question: [question]
+        A) [option A]
+        B) [option B]
+        C) [option C]
+        D) [option D]
+        Correct Answer: [correct option]
+        """
+    response = model.generate_content(prompt).text.strip()
+    return response.split("\n\n")  # Split by each question block
+
+# Streamlit Interface for Interactive Question Answering
+st.title("Interactive MCQ Generator")
+
+# Ensure session state to track progress
+if 'mcqs_generated' not in st.session_state:
+    st.session_state.mcqs_generated = False
+if 'user_responses' not in st.session_state:
+    st.session_state.user_responses = {}
+if 'topics' not in st.session_state:
+    st.session_state.topics = {}
+
+# File uploader and MCQ type selection
+uploaded_files = st.file_uploader("Upload files (PDF, TXT, DOCX, CSV)", type=['pdf', 'txt', 'docx', 'csv'], accept_multiple_files=True)
+mcq_type = st.selectbox("Select MCQ Type", ["Aptitude-Based", "Paragraph-Based"])
+
+# Handle multiple file uploads for aptitude-based MCQs
+if uploaded_files:
+    text_data = ""
+    for uploaded_file in uploaded_files:
+        file_path = os.path.join(UPLOAD_FOLDER, uploaded_file.name)
+        with open(file_path, "wb") as f:
+            f.write(uploaded_file.read())
+        
+        # Extract data based on file type
+        text_data += extract_text_from_file(file_path)
+    
+    if text_data:
+        num_questions = st.number_input("Number of MCQs to generate", min_value=1, step=1, value=5)
+        if st.button("Generate MCQs"):
+            mcqs = generate_mcqs_from_text(text_data, num_questions, mcq_type)
+            st.session_state.mcqs_generated = True  # Flag that MCQs are generated
+            st.session_state.mcqs = mcqs  # Store the generated MCQs in session state
+
+        # Only show questions after MCQs are generated
+        if st.session_state.mcqs_generated:
+            # Create a dictionary to store user responses
+            user_responses = st.session_state.user_responses
+            correct_answers = {}
+            st.subheader("Generated MCQs")
+            topic_counter = {}
+
+            # Display each question with options
+            for idx, mcq in enumerate(st.session_state.mcqs):
+                question_info = mcq.split("\n")
+                
+                # Filter out empty lines to prevent errors
+                question_info = [line for line in question_info if line.strip()]  # remove empty lines
+
+                # Check if the question_info has enough elements
+                if len(question_info) < 7:  # Ensure we have at least 7 lines (question, 4 options, and correct answer)
+                    st.warning(f"Question {idx + 1} is missing some parts and will be skipped.")
+                    continue
+
+                # Extract question text
+                question = question_info[1].replace("Question:", "").strip()
+
+                # Extract options (A to D)
+                options = []
+                option_map = {}
+                for i, line in enumerate(question_info[2:6]):
+                    if line.strip() and ')' in line:
+                        parts = line.split(')', 1)
+                        if len(parts) == 2:
+                            option_label = chr(65 + i)  # 'A', 'B', 'C', 'D'
+                            options.append(parts[1].strip())
+                            option_map[option_label] = parts[1].strip()  # Map option label to its text
+
+                # Extract correct answer and map it to the correct option (A, B, C, D)
+                correct_answer = None
+                for line in question_info[6:]:
+                    if line.strip().startswith("Correct Answer:"):
+                        correct_answer = line.replace("Correct Answer:", "").strip().upper()  # Ensure it's uppercase for comparison
+
+                # Store the correct answer in the correct_answer dictionary
+                correct_answers[idx] = correct_answer
+
+                # Track topics
+                topic = question.split()[-1]  # Assuming the topic is the last word of the question
+                if topic not in topic_counter:
+                    topic_counter[topic] = {'attempted': 0, 'not_attempted': 0}
+
+                # Display the question and options
+                st.write(f"*{question}*")
+                user_answer = st.radio(f"Choose your answer", options, key=f"question_{idx}")
+
+                if user_answer:
+                    # Match the user answer to the option label (A, B, C, D)
+                    for label, option in option_map.items():
+                        if user_answer == option:
+                            user_responses[idx] = label  # Store the option label ('A', 'B', 'C', 'D')
+                            topic_counter[topic]['attempted'] += 1
+                        else:
+                            topic_counter[topic]['not_attempted'] += 1
+
+            if st.button("Submit Answers"):
+                # Calculate score (compare answers with the correct answer)
+                score = sum(1 for idx, answer in user_responses.items() if answer.strip().upper() == correct_answers[idx].strip())
+                total_questions = len(st.session_state.mcqs)
+                percentage_score = (score / total_questions) * 100
+                st.write(f"Your total score is: {score}/{total_questions} ({percentage_score:.2f}%)")
+
+                if score < total_questions:
+                    st.write("Review the questions you missed and focus on the topics that need improvement.")
+                
+                # Visualization: Score per Question
+                st.subheader("Performance Analysis")
+                question_performance = [(i+1, correct_answers[i], user_responses.get(i)) for i in range(total_questions)]
+                
+                # Creating a dataframe for visualization
+                df = pd.DataFrame(question_performance, columns=["Question", "Correct Answer", "Your Answer"])
+                df['Correct'] = df['Correct Answer'] == df['Your Answer']
+                
+                # Plotting the correctness of answers
+                fig, ax = plt.subplots(figsize=(8, 6))
+                sns.countplot(data=df, x="Correct", palette="coolwarm", ax=ax)
+                ax.set_title("Correct vs Incorrect Answers")
+                ax.set_xlabel("Correct Answer (True/False)")
+                ax.set_ylabel("Number of Questions")
+                st.pyplot(fig)
+
+                # Showing questions missed by the user
+                missed_questions = df[df["Correct"] == False]
+                if not missed_questions.empty:
+                    st.subheader("Questions You Missed")
+                    for idx, row in missed_questions.iterrows():
+                        st.write(f"*Question {row['Question']}*: Correct Answer: {row['Correct Answer']}, Your Answer: {row['Your Answer']}")
+
+                # Showing questions answered correctly as reference
+                correct_questions = df[df["Correct"] == True]
+                if not correct_questions.empty:
+                    st.subheader("Correctly Answered Questions")
+                    for idx, row in correct_questions.iterrows():
+                        st.write(f"*Question {row['Question']}*: Your Answer: {row['Your Answer']}")
+
+                # Topic Analysis
+                topic_analysis = pd.DataFrame.from_dict(topic_counter, orient="index")
+                topic_analysis['Total Questions'] = topic_analysis['attempted'] + topic_analysis['not_attempted']
+                topic_analysis['Attempted %'] = (topic_analysis['attempted'] / topic_analysis['Total Questions']) * 100
+                topic_analysis['Not Attempted %'] = (topic_analysis['not_attempted'] / topic_analysis['Total Questions']) * 100
+
+                st.subheader("Topic-wise Attempt Analysis")
+                st.write(topic_analysis
